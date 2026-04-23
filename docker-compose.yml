@@ -55,6 +55,7 @@ services:
     volumes:
       - ./data/static:/saygo_web/static
       - ./data/media:/saygo_web/media
+      - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
 
     networks:
       - saygo_net

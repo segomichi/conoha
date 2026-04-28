@@ -1,9 +1,11 @@
-import os, discord, asyncpg
+import os, discord, asyncpg, logging
 import pathlib
 from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -51,9 +53,9 @@ bot = SayGoBot(
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user}としてログインしました")
-    print("参加中のサーバー：")
+    logging.info(f"{bot.user}としてログインしました")
+    logging.info("参加中のサーバー：")
     for guild in bot.guilds:
-        print(guild.name)
+        logging.info(guild.name)
 
 bot.run(TOKEN)

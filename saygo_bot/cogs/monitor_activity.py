@@ -1,4 +1,7 @@
+import logging
 from discord.ext import commands
+
+logger = logging.getLogger(__name__)
 
 class MonitorActivity(commands.Cog):
     def __init__(self, bot):
@@ -59,3 +62,4 @@ class MonitorActivity(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(MonitorActivity(bot))
+    logger.info("MonitorActivity cogを読み込みました。")

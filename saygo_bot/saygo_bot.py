@@ -29,7 +29,10 @@ class SayGoBot(commands.Bot):
         cogs_dir = pathlib.Path(__file__).parent / "cogs"
         for filename in os.listdir(cogs_dir):
             if filename.endswith(".py"):
-                await self.load_extension(f"cogs.{filename[:-3]}")
+                try:
+                    await self.load_extension(f"cogs.{filename[:-3]}")
+                except Exception as e:
+                    logging.error(f"{filename} のロードに失敗しました: {e}", exc_info=True)
         
         #コマンドツリーを同期
         await self.tree.sync()

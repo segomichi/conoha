@@ -16,6 +16,11 @@ async def ensure_config_table(db_pool):
                 kick_grace_period INTEGER NOT NULL DEFAULT 10
             )
         """)
+        # テーブルが既存の場合に不足列を追加するマイグレーション
+        await connection.execute("""
+            ALTER TABLE configs
+                ADD COLUMN IF NOT EXISTS message_channel_id BIGINT
+        """)
 
 class Config(commands.Cog):
     def __init__(self, bot):

@@ -9,7 +9,7 @@ class MonitorActivity(commands.Cog):
 
     async def cog_load(self):
         await self.ensure_activity_table()
-        return await super().cog_load()
+        await super().cog_load()
     
     async def ensure_activity_table(self):
         async with self.bot.db.acquire() as conn:

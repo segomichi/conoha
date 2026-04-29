@@ -16,14 +16,16 @@ class ManageMember(commands.Cog):
         await self.ensure_warning_table()
         await self.ensure_user_activity_table()
 
-        return await super().cog_load()
+        await super().cog_load()
         
     async def cog_unload(self):
+        logger.info("ManageMember cogをアンロードします。")
         self.activity_check_loop.cancel() #Cogがアンロードされる際に定期タスクを停止
     
     @tasks.loop(hours=24)
     async def activity_check_loop(self):
         try:
+            logger.info("定期タスク: activity_check を開始します。")
             await self.activity_check()
         except Exception as e:
             logger.error(f"activity_check でエラーが発生しました: {e}", exc_info=True)

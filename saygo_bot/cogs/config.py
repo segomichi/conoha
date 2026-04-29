@@ -28,7 +28,7 @@ class Config(commands.Cog):
 
     async def cog_load(self):
         await ensure_config_table(self.bot.db)
-        return await super().cog_load()
+        await super().cog_load()
     
     async def set_manage_channel(self, guild_id: int, channel_id: int):
         async with self.bot.db.acquire() as conn:

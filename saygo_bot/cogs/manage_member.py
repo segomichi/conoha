@@ -40,7 +40,6 @@ class ManageMember(commands.Cog):
     
     async def activity_check(self):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        # connを早期に解放し、サブメソッドとのコネクション入れ子を防ぐ
         async with self.bot.db.acquire() as conn:
             guilds = await conn.fetch("SELECT guild_id FROM configs") #管理対象のサーバーを取得
             management_records = await conn.fetch("SELECT guild_id, last_check FROM management")
@@ -50,8 +49,10 @@ class ManageMember(commands.Cog):
         for guild in guilds: #各サーバーごとに処理
             guild_id = guild["guild_id"] #サーバーIDを取得
             last_check = last_checks.get(guild_id)
+            logger.info(f"Guild ID {guild_id}のactivity_checkを開始します。")
 
             if last_check and (now - last_check).total_seconds() < 86400: #前回チェックから1日経過していない場合はスキップ
+                logger.info(f"Guild ID {guild_id} は前回チェックから1日経過していないためスキップします。")
                 continue
             
             await self.manage_warned_members(guild_id) #警告対象メンバーの管理
@@ -140,6 +141,7 @@ class ManageMember(commands.Cog):
         return management_channel_id, message_channel_id, warning_grace_period, kick_grace_period
 
     async def manage_warned_members(self, guild_id: int): #警告対象ユーザーの管理
+        logger.info(f"Guild ID {guild_id}の警告対象ユーザーの管理を開始します。")
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         configs = await self.get_configs(guild_id)
         if not configs:
@@ -187,7 +189,8 @@ class ManageMember(commands.Cog):
                 except (discord.Forbidden, discord.HTTPException) as e:
                     logger.error(f"Guild ID {guild_id}のメンバーID {warned_member_id}の取得に失敗しました: {e}", exc_info=True)
                     continue
-
+                
+                logger.info(f"Guild ID {guild_id}の警告対象ユーザーID {warned_member_id}の確認を開始します。")
                 warning_date = warned_member["warning_time"] #警告日時を取得
                 kick_date = warning_date + timedelta(days=kick_grace_period) #警告日にキック猶予を足したキック日を計算
                 last_active_record = await conn.fetchrow("""
@@ -211,6 +214,7 @@ class ManageMember(commands.Cog):
                         if member:
                             try:
                                 await member.kick(reason="非アクティブのため") #ユーザーをキック
+                                logger.info(f"Guild ID {guild_id}のメンバーID {warned_member_id}をキックしました。")
                             except (discord.Forbidden, discord.HTTPException) as e:
                                 logger.error(f"Guild ID {guild_id}のメンバーID {warned_member_id}のキックに失敗しました: {e}", exc_info=True)
                                 continue
@@ -231,6 +235,7 @@ class ManageMember(commands.Cog):
                         pass
 
     async def manage_members(self, guild_id: int):
+        logger.info(f"Guild ID {guild_id}の通常メンバー管理を開始します。")
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         configs = await self.get_configs(guild_id)
         if not configs:
@@ -266,16 +271,18 @@ class ManageMember(commands.Cog):
             members = guild.fetch_members(limit=None) #全メンバーを取得する
             async with self.bot.db.acquire() as conn:
                 async for member in members:
+                    logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認します。")
                     if member.bot: #Botは管理対象外
                         continue
 
-                #ユーザーの最終活動日時を取得
+                    #ユーザーの最終活動日時を取得
                     last_active_record = await conn.fetchrow("""
                         SELECT last_active FROM user_activity
                         WHERE guild_id = $1 AND user_id = $2
                     """, guild_id, member.id)
 
                     if not last_active_record: #ユーザーが活動テーブルに存在しない場合は追加
+                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}は活動テーブルに存在しないため、初期レコードを追加します。")
                         await conn.execute("""
                             INSERT INTO user_activity (guild_id, user_id, last_active, activity_type, is_kicked)
                             VALUES ($1, $2, NOW() AT TIME ZONE 'UTC', 'initial_check', FALSE)
@@ -292,7 +299,7 @@ class ManageMember(commands.Cog):
                             WHERE guild_id = $1 AND user_id = $2
                         """, guild_id, member.id) #ユーザーが警告対象かどうかを取得
                         if warning: #ユーザーがすでに警告対象の場合はスキップ
-                            logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。")
+                            logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。すでに警告対象です。")
                             continue
                         await self.add_warning(guild_id, member.id, conn) #警告テーブルにユーザーを追加
                         try:
@@ -301,7 +308,7 @@ class ManageMember(commands.Cog):
                             logger.error(f"Guild ID {guild_id}のメッセージチャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
                         logger.info(f"Guild ID {guild_id}のメンバー{member.name}に警告を追加しました。")
                     else: #警告日数を過ぎていない場合
-                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。")
+                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。警告日数を過ぎていません。{last_active}が最終活動日時です。")
         except (discord.Forbidden, discord.HTTPException) as e:
             logger.error(f"Guild ID {guild_id}のメンバー取得に失敗しました: {e}", exc_info=True)
             return

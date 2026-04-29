@@ -50,15 +50,26 @@ class ManageMember(commands.Cog):
             guild_id = guild["guild_id"] #サーバーIDを取得
             last_check = last_checks.get(guild_id)
             logger.info(f"Guild ID {guild_id}のactivity_checkを開始します。")
+            configs = await self.get_configs(guild_id)
+            if not configs:
+                logger.warning(f"Guild ID {guild_id}の設定が不完全なため、警告対象ユーザーの管理をスキップします。")
+                continue
+            management_channel, message_channel, warning_grace_period, kick_grace_period = configs
+
+            guild = await self.get_guild(guild_id, management_channel)
+            if not guild:
+                continue
 
             if last_check and (now - last_check).total_seconds() < 86400: #前回チェックから1日経過していない場合はスキップ
                 logger.info(f"Guild ID {guild_id} は前回チェックから1日経過していないためスキップします。")
                 continue
             
-            await self.manage_warned_members(guild_id) #警告対象メンバーの管理
-            await self.manage_members(guild_id) #その他のメンバー管理の処理
+            await self.manage_warned_members(guild, management_channel, message_channel, warning_grace_period, kick_grace_period) #警告対象メンバーの管理
+            await self.manage_members(guild, management_channel, message_channel, warning_grace_period, kick_grace_period) #その他のメンバー管理の処理
             
             await self.update_management_table(guild_id)
+            logger.info(f"Guild ID {guild_id}のactivity_checkが完了しました。")
+        logger.info("定期タスク: activity_check がすべてのGuildで完了しました。")
 
     async def ensure_management_table(self):
         async with self.bot.db.acquire() as conn:
@@ -137,141 +148,123 @@ class ManageMember(commands.Cog):
         if management_channel_id is None or message_channel_id is None or warning_grace_period is None or kick_grace_period is None:
             logger.warning(f"Guild ID {guild_id}の設定が不完全です: {config_record}")
             return None
-        
-        return management_channel_id, message_channel_id, warning_grace_period, kick_grace_period
-
-    async def manage_warned_members(self, guild_id: int): #警告対象ユーザーの管理
-        logger.info(f"Guild ID {guild_id}の警告対象ユーザーの管理を開始します。")
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        configs = await self.get_configs(guild_id)
-        if not configs:
-            logger.warning(f"Guild ID {guild_id}の設定が不完全なため、警告対象ユーザーの管理をスキップします。")
-            return
-        management_channel_id, message_channel_id, warning_grace_period, kick_grace_period = configs
         management_channel = self.bot.get_channel(management_channel_id) #管理チャンネルを取得
         if not management_channel: 
             logger.warning(f"Guild ID {guild_id}の管理チャンネルが見つかりません: チャンネルID {management_channel_id}")
-            return
+            return None
         message_channel = self.bot.get_channel(message_channel_id) #メッセージ送信チャンネルを取得
         if not message_channel:
             logger.warning(f"Guild ID {guild_id}のメッセージ送信チャンネルが見つかりません: チャンネルID {message_channel_id}")
-            return
+            return None
 
-        async with self.bot.db.acquire() as conn:
-            warned_members = await conn.fetch("""
-                SELECT user_id, warning_time FROM warning
-                WHERE guild_id = $1
-            """, guild_id) #警告対象ユーザーの情報取得
-            
-            for warned_member in warned_members: #警告対象ユーザーごとに処理
-                warned_member_id = warned_member["user_id"] #警告対象ユーザーIDを取得
-                guild = self.bot.get_guild(guild_id) #サーバーを取得
-                if not guild:
-                    await conn.execute("DELETE FROM warning WHERE guild_id = $1", guild_id)
-                    await conn.execute("DELETE FROM user_activity WHERE guild_id = $1", guild_id)
-                    await conn.execute("DELETE FROM management WHERE guild_id = $1", guild_id)
-                    await conn.execute("DELETE FROM configs WHERE guild_id = $1", guild_id)
-                    logger.warning(f"Guild ID {guild_id}が見つからないため、関連するすべてのレコードを削除しました。")
-                    break
-                try:
-                    member = await guild.fetch_member(warned_member_id)
-                except discord.NotFound:
-                    logger.warning(f"Guild ID {guild_id}のメンバーID {warned_member_id}が見つかりません。警告を削除します。")
-                    try:
-                        await management_channel.send(f"ユーザーID {warned_member_id}はサーバーに存在しないため、警告を削除しました。") #管理チャンネルに警告解除メッセージを送信
-                    except (discord.Forbidden, discord.HTTPException) as e:
-                        logger.error(f"Guild ID {guild_id}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
-                    await conn.execute("""
-                        DELETE FROM warning
-                        WHERE guild_id = $1 AND user_id = $2
-                    """, guild_id, warned_member_id)
-                    continue
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    logger.error(f"Guild ID {guild_id}のメンバーID {warned_member_id}の取得に失敗しました: {e}", exc_info=True)
-                    continue
-                
-                logger.info(f"Guild ID {guild_id}の警告対象ユーザーID {warned_member_id}の確認を開始します。")
-                warning_date = warned_member["warning_time"] #警告日時を取得
-                kick_date = warning_date + timedelta(days=kick_grace_period) #警告日にキック猶予を足したキック日を計算
-                last_active_record = await conn.fetchrow("""
-                    SELECT last_active FROM user_activity
-                    WHERE guild_id = $1 AND user_id = $2
-                """, guild_id, warned_member_id) #ユーザーの最終活動日時を取得
-                last_active = last_active_record["last_active"] if last_active_record else None
-            
-                if last_active and warning_date < last_active: #ユーザーが警告後に活動している場合
-                    await conn.execute("""
-                        DELETE FROM warning
-                        WHERE guild_id = $1 AND user_id = $2
-                    """, guild_id, warned_member_id) #警告テーブルからユーザーを削除
-                    logger.info(f"Guild ID {guild_id}のメンバーID {warned_member_id}の警告を解除しました。")
-                    try:
-                        await message_channel.send(f"{member.mention}さんは活動が確認されたため、警告が解除されました。") #メッセージ送信チャンネルに警告解除メッセージを送信
-                    except (discord.Forbidden, discord.HTTPException) as e:
-                        logger.error(f"Guild ID {guild_id}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
-                else: #ユーザーが警告後に活動していない場合
-                    if kick_date < now: #キック日を過ぎている場合はキック対象
-                        if member:
-                            try:
-                                await member.kick(reason="非アクティブのため") #ユーザーをキック
-                                logger.info(f"Guild ID {guild_id}のメンバーID {warned_member_id}をキックしました。")
-                            except (discord.Forbidden, discord.HTTPException) as e:
-                                logger.error(f"Guild ID {guild_id}のメンバーID {warned_member_id}のキックに失敗しました: {e}", exc_info=True)
-                                continue
-                        await conn.execute("""
-                            DELETE FROM warning
-                            WHERE guild_id = $1 AND user_id = $2
-                        """, guild_id, warned_member_id) #警告テーブルからユーザーを削除
-                        await conn.execute("""
-                            UPDATE user_activity
-                            SET is_kicked = TRUE
-                            WHERE guild_id = $1 AND user_id = $2
-                        """, guild_id, warned_member_id) #ユーザーの活動テーブルのis_kickedをTrueに更新
-                        try:
-                            await message_channel.send(f"{member.mention}さんはキックされました。") #メッセージ送信チャンネルにキックメッセージを送信
-                        except (discord.Forbidden, discord.HTTPException) as e:
-                            logger.error(f"Guild ID {guild_id}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
-                    else: #キック日を過ぎていない場合は動作なし
-                        pass
-
-    async def manage_members(self, guild_id: int):
-        logger.info(f"Guild ID {guild_id}の通常メンバー管理を開始します。")
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        configs = await self.get_configs(guild_id)
-        if not configs:
-            logger.warning(f"Guild ID {guild_id}の設定が不完全なため、警告対象ユーザーの管理をスキップします。")
-            return
-        management_channel_id, message_channel_id, warning_grace_period, kick_grace_period = configs
-        management_channel = self.bot.get_channel(management_channel_id) # 管理チャンネルを取得
-        if not management_channel:
-            logger.warning(f"Guild ID {guild_id}の管理チャンネルが見つかりません: チャンネルID {management_channel_id}")
-            return
-        message_channel = self.bot.get_channel(message_channel_id) # メッセージチャンネルを取得
-        if not message_channel:
-            logger.warning(f"Guild ID {guild_id}のメッセージチャンネルが見つかりません: チャンネルID {message_channel_id}")
-            return
-
-        # サーバーを取得
+        return management_channel, message_channel, warning_grace_period, kick_grace_period
+    
+    async def get_guild(self, guild_id: int, management_channel):
         guild = self.bot.get_guild(guild_id)
         if not guild:
+            logger.warning(f"Guild ID {guild_id}が見つかりません。")
             async with self.bot.db.acquire() as conn:
                 await conn.execute("DELETE FROM warning WHERE guild_id = $1", guild_id)
                 await conn.execute("DELETE FROM user_activity WHERE guild_id = $1", guild_id)
                 await conn.execute("DELETE FROM management WHERE guild_id = $1", guild_id)
                 await conn.execute("DELETE FROM configs WHERE guild_id = $1", guild_id)
                 logger.warning(f"Guild ID {guild_id}が見つからないため、関連するすべてのレコードを削除しました。")
-                try:
-                    await management_channel.send(f"Guild ID {guild_id}が見つからないため、関連するすべてのレコードを削除しました。") #管理チャンネルにメッセージを送信
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    logger.error(f"Guild ID {guild_id}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
-            return
+            try:
+                await management_channel.send(f"Guild ID {guild_id}が見つからないため、関連するすべてのレコードを削除しました。")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                logger.error(f"Guild ID {guild_id}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
+            return None
+        return guild
+    
 
-        # メンバー管理処理
+    async def manage_warned_members(self, guild, management_channel, message_channel, warning_grace_period, kick_grace_period): #警告対象ユーザーの管理
+        logger.info(f"Guild {guild.name}の警告対象ユーザーの管理を開始します。")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        async with self.bot.db.acquire() as conn:
+            warned_members = await conn.fetch("""
+                SELECT user_id, warning_time FROM warning
+                WHERE guild_id = $1
+            """, guild.id) #警告対象ユーザーの情報取得
+            
+            for warned_member in warned_members: #警告対象ユーザーごとに処理
+                warned_member_id = warned_member["user_id"] #警告対象ユーザーIDを取得
+                guild = await self.get_guild(guild.id, management_channel) #サーバーを取得
+                if not guild:
+                    continue
+                try:
+                    member = await guild.fetch_member(warned_member_id)
+                except discord.NotFound:
+                    logger.warning(f"Guild {guild.name}のメンバーID {warned_member_id}が見つかりません。警告を削除します。")
+                    try:
+                        await management_channel.send(f"ユーザーID {warned_member_id}はサーバーに存在しないため、警告を削除しました。") #管理チャンネルに警告解除メッセージを送信
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        logger.error(f"Guild {guild.name}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
+                    await conn.execute("""
+                        DELETE FROM warning
+                        WHERE guild_id = $1 AND user_id = $2
+                    """, guild.id, warned_member_id)
+                    continue
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    logger.error(f"Guild {guild.name}のメンバーID {warned_member_id}の取得に失敗しました: {e}", exc_info=True)
+                    continue
+                
+                logger.info(f"Guild {guild.name}の警告対象ユーザー{member.name}の確認を開始します。")
+                warning_date = warned_member["warning_time"] #警告日時を取得
+                kick_date = warning_date + timedelta(days=kick_grace_period) #警告日にキック猶予を足したキック日を計算
+                last_active_record = await conn.fetchrow("""
+                    SELECT last_active FROM user_activity
+                    WHERE guild_id = $1 AND user_id = $2
+                """, guild.id, warned_member_id) #ユーザーの最終活動日時を取得
+                last_active = last_active_record["last_active"] if last_active_record else None
+            
+                if last_active and warning_date < last_active: #ユーザーが警告後に活動している場合
+                    await conn.execute("""
+                        DELETE FROM warning
+                        WHERE guild_id = $1 AND user_id = $2
+                    """, guild.id, warned_member_id) #警告テーブルからユーザーを削除
+                    logger.info(f"Guild {guild.name}のメンバー{member.name}の警告を解除しました。")
+                    try:
+                        await message_channel.send(f"{member.mention}さんは活動が確認されたため、警告が解除されました。") #メッセージ送信チャンネルに警告解除メッセージを送信
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        logger.error(f"Guild {guild.name}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
+                else: #ユーザーが警告後に活動していない場合
+                    if kick_date < now: #キック日を過ぎている場合はキック対象
+                        if member:
+                            try:
+                                await member.kick(reason="非アクティブのため") #ユーザーをキック
+                                logger.info(f"Guild {guild.name}のメンバー{member.name}をキックしました。")
+                            except (discord.Forbidden, discord.HTTPException) as e:
+                                logger.error(f"Guild {guild.name}のメンバー{member.name}のキックに失敗しました: {e}", exc_info=True)
+                                continue
+                        await conn.execute("""
+                            DELETE FROM warning
+                            WHERE guild_id = $1 AND user_id = $2
+                        """, guild.id, warned_member_id) #警告テーブルからユーザーを削除
+                        await conn.execute("""
+                            UPDATE user_activity
+                            SET is_kicked = TRUE
+                            WHERE guild_id = $1 AND user_id = $2
+                        """, guild.id, warned_member_id) #ユーザーの活動テーブルのis_kickedをTrueに更新
+                        try:
+                            await message_channel.send(f"{member.mention}さんはキックされました。") #メッセージ送信チャンネルにキックメッセージを送信
+                        except (discord.Forbidden, discord.HTTPException) as e:
+                            logger.error(f"Guild {guild.name}の管理チャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
+                    else: #キック日を過ぎていない場合は動作なし
+                        pass
+                        logger.info(f"Guild {guild.name}のメンバー{member.name}は警告後に活動が確認されませんでした。キック日 {kick_date} までは猶予があります。")
+        logger.info(f"Guild {guild.name}の警告対象ユーザーの管理が完了しました。")
+
+    async def manage_members(self, guild, management_channel, message_channel, warning_grace_period, kick_grace_period): #その他のメンバー管理の処理
+        logger.info(f"Guild {guild.name}の通常メンバー管理を開始します。")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         try:
             members = guild.fetch_members(limit=None) #全メンバーを取得する
+            i = 0
             async with self.bot.db.acquire() as conn:
-                async for member in members:
-                    logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認します。")
+                async for member in members: #メンバーごとに処理 
+                    i = i + 1
+                    logger.info(f"Guild {guild.name}のメンバー{member.name}を確認します。{i}/{len(guild.members)}")
                     if member.bot: #Botは管理対象外
                         continue
 
@@ -279,16 +272,16 @@ class ManageMember(commands.Cog):
                     last_active_record = await conn.fetchrow("""
                         SELECT last_active FROM user_activity
                         WHERE guild_id = $1 AND user_id = $2
-                    """, guild_id, member.id)
+                    """, guild.id, member.id)
 
                     if not last_active_record: #ユーザーが活動テーブルに存在しない場合は追加
-                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}は活動テーブルに存在しないため、初期レコードを追加します。")
+                        logger.info(f"Guild {guild.name}のメンバー{member.name}は活動テーブルに存在しないため、初期レコードを追加します。")
                         await conn.execute("""
                             INSERT INTO user_activity (guild_id, user_id, last_active, activity_type, is_kicked)
                             VALUES ($1, $2, NOW() AT TIME ZONE 'UTC', 'initial_check', FALSE)
                             ON CONFLICT (guild_id, user_id)
                             DO UPDATE SET last_active = NOW() AT TIME ZONE 'UTC', activity_type = 'initial_check', is_kicked = FALSE
-                        """, guild_id, member.id)
+                        """, guild.id, member.id)
                         continue
                     else: #ユーザーの最終活動日時を取得
                         last_active = last_active_record["last_active"]
@@ -297,22 +290,23 @@ class ManageMember(commands.Cog):
                         warning = await conn.fetchrow("""
                             SELECT * FROM warning
                             WHERE guild_id = $1 AND user_id = $2
-                        """, guild_id, member.id) #ユーザーが警告対象かどうかを取得
+                        """, guild.id, member.id) #ユーザーが警告対象かどうかを取得
                         if warning: #ユーザーがすでに警告対象の場合はスキップ
-                            logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。すでに警告対象です。")
+                            logger.info(f"Guild {guild.name}のメンバー{member.name}を確認しました。すでに警告対象です。")
                             continue
-                        await self.add_warning(guild_id, member.id, conn) #警告テーブルにユーザーを追加
+                        await self.add_warning(guild.id, member.id, conn) #警告テーブルにユーザーを追加
                         try:
                             await message_channel.send(f"{member.mention}さんは{warning_grace_period}日間活動がありませんでした。{kick_grace_period}日後まで活動がない場合キックされます。") #メッセージチャンネルに警告メッセージを送信
                         except (discord.Forbidden, discord.HTTPException) as e:
-                            logger.error(f"Guild ID {guild_id}のメッセージチャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
-                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}に警告を追加しました。")
+                            logger.error(f"Guild {guild.name}のメッセージチャンネルへのメッセージ送信に失敗しました: {e}", exc_info=True)
+                        logger.info(f"Guild {guild.name}のメンバー{member.name}に警告を追加しました。")
                     else: #警告日数を過ぎていない場合
-                        logger.info(f"Guild ID {guild_id}のメンバー{member.name}を確認しました。警告日数を過ぎていません。{last_active}が最終活動日時です。")
+                        logger.info(f"Guild {guild.name}のメンバー{member.name}を確認しました。警告日数を過ぎていません。{last_active}が最終活動日時です。")
         except (discord.Forbidden, discord.HTTPException) as e:
-            logger.error(f"Guild ID {guild_id}のメンバー取得に失敗しました: {e}", exc_info=True)
+            logger.error(f"Guild {guild.name}のメンバー取得に失敗しました: {e}", exc_info=True)
             return
-        
+        logger.info(f"Guild {guild.name}の通常メンバー管理が完了しました。")
+
 async def setup(bot):
     await bot.add_cog(ManageMember(bot))
     logger.info("ManageMember cogを読み込みました。")
